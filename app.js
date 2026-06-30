@@ -124,29 +124,41 @@ let recording = false, mStream = null, analyser = null, recAF = null, recIv = nu
 let lastMidi = -1, lastNoteT = 0;
 const HOLD_MS = 320;
 
-// ── PITCH DETECTION (autocorrelation) ──
+// ── PITCH DETECTION (autocorrelation, more permissive thresholds) ──
+let lastRMS = 0; // exposed for debug display
 function detectPitch(buf, sr) {
   const N = buf.length;
   let rms = 0;
   for (let i = 0; i < N; i++) rms += buf[i] * buf[i];
   rms = Math.sqrt(rms / N);
-  if (rms < 0.009) return -1;
+  lastRMS = rms;
+  // Lowered threshold significantly — was 0.009, now 0.003
+  if (rms < 0.003) return -1;
+
+  // Normalize buffer to improve autocorrelation on quiet signals
+  let maxAbs = 0;
+  for (let i = 0; i < N; i++) { const a = Math.abs(buf[i]); if (a > maxAbs) maxAbs = a; }
+  const norm = maxAbs > 0 ? buf.map(v => v / maxAbs) : buf;
+
   const ac2 = new Float32Array(N);
   for (let lag = 0; lag < N; lag++) {
     let s = 0;
-    for (let i = 0; i < N - lag; i++) s += buf[i] * buf[i + lag];
+    for (let i = 0; i < N - lag; i++) s += norm[i] * norm[i + lag];
     ac2[lag] = s;
   }
   let start = -1;
   for (let i = 1; i < N; i++) { if (ac2[i] < 0) { start = i; break; } }
-  if (start < 0) return -1;
+  if (start < 0) start = 1; // fallback instead of bailing out
   let bestLag = start, bestVal = ac2[start];
   for (let i = start; i < N; i++) { if (ac2[i] > bestVal) { bestVal = ac2[i]; bestLag = i; } }
-  if (bestVal < 0.003) return -1;
+  // Lowered threshold significantly — was 0.003 (of raw signal), now relative to normalized peak
+  if (bestVal < ac2[0] * 0.15) return -1;
   const y1 = ac2[bestLag - 1] || 0, y2 = ac2[bestLag], y3 = ac2[bestLag + 1] || 0;
   const d = 2 * y2 - y1 - y3;
   const shift = d ? ((y3 - y1) / (2 * d) * 0.5) : 0;
-  return sr / (bestLag + shift);
+  const freq = sr / (bestLag + shift);
+  if (!isFinite(freq) || freq <= 0) return -1;
+  return freq;
 }
 
 // ── MIC PERMISSION & RECORDING ──
@@ -258,9 +270,11 @@ function recLoop() {
   analyser.getByteTimeDomainData(bb);
   drawWave(bb);
   const freq = detectPitch(fb, getAC().sampleRate);
-  if (freq > 60 && freq < 1800) {
+  // Widened range: was 60-1800, now 50-2000 to catch more voice types
+  if (freq > 50 && freq < 2000) {
     const midi = f2m(freq);
-    if (midi >= 36 && midi <= 96) {
+    // Widened MIDI range: was 36-96, now 28-100
+    if (midi >= 28 && midi <= 100) {
       const inScale = smi().has(midi % 12);
       document.getElementById('pmN').textContent = mn(midi);
       document.getElementById('pmHz').textContent = freq.toFixed(1) + ' Hz';
@@ -277,10 +291,16 @@ function recLoop() {
         flashKey(midi, 'lit', 260);
         renderVis();
         updateBtns();
+        setTopStatus(rawMel.length + ' نت ضبط شد');
       }
+    } else {
+      // Frequency detected but outside playable range — show why nothing is captured
+      document.getElementById('pmN').textContent = '⚠';
+      document.getElementById('pmHz').textContent = freq.toFixed(0) + ' Hz (خارج محدوده)';
     }
   } else {
     document.getElementById('pmN').textContent = '—';
+    document.getElementById('pmHz').textContent = 'صدا: ' + (lastRMS * 1000).toFixed(1);
     lastMidi = -1;
   }
   recAF = requestAnimationFrame(recLoop);
